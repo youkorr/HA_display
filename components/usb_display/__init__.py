@@ -102,14 +102,14 @@ _LOGGER = logging.getLogger(__name__)
 # the two shapes of their device apart that way: one identifier for a board that
 # is only a display, another for their composite one with touch and audio. Ours
 # grows a second interface when the sender drive is on, which matches neither.
-#_ESPRESSIF_DISPLAY_ONLY_PID = 0x2987
-#_ESPRESSIF_COMPOSITE_PID = 0x2986
+_ESPRESSIF_DISPLAY_ONLY_PID = 0x2987
+_ESPRESSIF_COMPOSITE_PID = 0x2986
 
 # The PC half, carried by the board itself. Alongside this file so there is one
 # place to look for everything this display needs.
-#SENDER_SCRIPT = os.path.join(os.path.dirname(__file__), "udisp_send.py")
+SENDER_SCRIPT = os.path.join(os.path.dirname(__file__), "udisp_send.py")
 
-#_USB_SPEEDS = {"high": True, "full": False}
+_USB_SPEEDS = {"high": True, "full": False}
 
 
 def _warn_about_espressif_driver(config):
