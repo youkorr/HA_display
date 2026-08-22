@@ -281,15 +281,22 @@ extern "C" bool tud_msc_is_writable_cb(uint8_t lun) {
   return false;
 }
 
+// CORRECTION PRINCIPALE : Gestion correcte des LBA multiples et des offsets dynamiques
 extern "C" int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
   (void) lun;
-  if (!g_ready || lba >= (uint32_t) (SECTOR_DATA + g_total_clusters))
+  
+  // L'OS peut demander à lire plusieurs secteurs d'un coup.
+  // L'offset nous indique à quel octet nous en sommes par rapport au LBA de départ de la requête.
+  uint32_t current_lba = lba + (offset / SECTOR_SIZE);
+  uint32_t sector_offset = offset % SECTOR_SIZE;
+
+  if (!g_ready || current_lba >= (uint32_t) (SECTOR_DATA + g_total_clusters))
     return -1;
 
-  // Synthesise the whole sector, then hand back the slice that was asked for.
-  // Hosts normally ask for all of it at once, but they are allowed not to.
-  static uint8_t sector[SECTOR_SIZE];
-  switch (lba) {
+  // Allocation sur la pile pour des raisons de performance et de thread-safety
+  uint8_t sector[SECTOR_SIZE];
+  
+  switch (current_lba) {
     case SECTOR_BOOT:
       build_boot_sector(sector);
       break;
@@ -300,16 +307,18 @@ extern "C" int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
       build_root_sector(sector);
       break;
     default:
-      build_data_sector(sector, lba);
+      build_data_sector(sector, current_lba);
       break;
   }
 
-  if (offset >= SECTOR_SIZE)
-    return 0;
-  uint32_t length = SECTOR_SIZE - offset;
+  // On renvoie la longueur restante valide dans ce secteur
+  uint32_t length = SECTOR_SIZE - sector_offset;
   if (length > bufsize)
     length = bufsize;
-  memcpy(buffer, sector + offset, length);
+    
+  memcpy(buffer, sector + sector_offset, length);
+  
+  // On indique à TinyUSB combien d'octets ont été copiés avec succès pour cette itération
   return (int32_t) length;
 }
 
