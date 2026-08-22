@@ -20,6 +20,7 @@
 
 #include "esphome/core/log.h"
 #include "esp_heap_caps.h"
+#include "freertos/ringbuf.h"
 
 #include <cerrno>
 #include <cstring>
@@ -27,7 +28,7 @@
 extern "C" {
 #include "freertos/task.h"
 #include <lwip/sockets.h>
-#include <lwip/tcp.h> // Ajouté pour TCP_KEEPIDLE, TCP_KEEPINTVL, etc.
+#include <lwip/tcp.h>
 }
 
 namespace esphome {
@@ -35,7 +36,8 @@ namespace usb_display {
 
 static const char *const TAG = "usb_display.net";
 
-static constexpr size_t NET_READ_SIZE = 16384;
+// Augmenté à 32 Ko pour saturer le débit brut du lien C6 / Wi-Fi
+static constexpr size_t NET_READ_SIZE = 32768;
 static constexpr int NET_RECV_TIMEOUT_S = 30;
 
 #ifdef USE_TOUCHSCREEN
@@ -62,7 +64,6 @@ void USBDisplay::queue_touch_(const touchscreen::TouchPoints_t &points) {
   this->last_touch_ = event;
   this->last_touch_valid_ = true;
 
-  // CORRECTION 4: S'assurer que le dépilage réussit avant de repiler pour éviter une race condition
   if (xQueueSend(this->touch_queue_, &event, 0) != pdTRUE) {
     TouchEvent discarded;
     if (xQueueReceive(this->touch_queue_, &discarded, 0) == pdTRUE) {
@@ -92,7 +93,6 @@ void USBDisplay::send_queued_messages_(int client) {
     return;
     
   TouchEvent event;
-  // CORRECTION 3: Utiliser xQueuePeek pour ne pas perdre l'event si send() échoue (buffer TCP plein)
   while (xQueuePeek(this->touch_queue_, &event, 0) == pdTRUE) {
     uint8_t message[2 + UDISP_NET_TOUCH_MAX * 5];
     message[0] = 'T';
@@ -107,9 +107,8 @@ void USBDisplay::send_queued_messages_(int client) {
     }
     
     if (::send(client, message, at, MSG_DONTWAIT) < 0)
-      return; // On arrête l'envoi, l'événement reste dans la file pour le prochain tour
+      return; 
       
-    // Si l'envoi a réussi, on le retire définitivement de la file
     xQueueReceive(this->touch_queue_, &event, 0);
   }
 #endif  // USE_TOUCHSCREEN
@@ -123,7 +122,7 @@ void USBDisplay::setup_network_() {
     this->touch_queue_ = xQueueCreate(8, sizeof(TouchEvent));
   }
 #endif
-  // PERFORMANCES FIX: Utiliser tskNO_AFFINITY au lieu de 0 pour ne pas paralyser le Wi-Fi
+  // Utilisation de tskNO_AFFINITY pour laisser FreeRTOS répartir la charge sur les deux cœurs RISC-V du P4
   xTaskCreatePinnedToCore(USBDisplay::network_task, "udispnet", 4096, this, 4, nullptr, tskNO_AFFINITY);
   ESP_LOGCONFIG(TAG, "Listening on port %u for frames", (unsigned) this->port_);
 }
@@ -131,9 +130,19 @@ void USBDisplay::setup_network_() {
 void USBDisplay::network_task(void *param) { static_cast<USBDisplay *>(param)->run_network_task(); }
 
 void USBDisplay::run_network_task() {
+  // Allocation d'un gros buffer de lecture en mémoire interne/PSRAM
   auto *buffer = (uint8_t *) heap_caps_malloc(NET_READ_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (buffer == nullptr) {
     ESP_LOGE(TAG, "Could not allocate the %u byte receive buffer", (unsigned) NET_READ_SIZE);
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  // Création d'un Ring Buffer de 128 Ko pour découpler totalement la réception TCP du décodage lourd
+  RingbufHandle_t ringbuf = xRingbufferCreate(128 * 1024, RINGBUF_TYPE_BYTEbuf);
+  if (ringbuf == nullptr) {
+    ESP_LOGE(TAG, "Could not create network ring buffer");
+    heap_caps_free(buffer);
     vTaskDelete(nullptr);
     return;
   }
@@ -172,23 +181,20 @@ void USBDisplay::run_network_task() {
 
       ::setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
       
-      // On conserve ce timeout, même s'il est secondaire par rapport à notre compteur manuel ci-dessous
       struct timeval timeout = {.tv_sec = NET_RECV_TIMEOUT_S, .tv_usec = 0};
       ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
       
-      // CORRECTION 2: Configuration fine du Keep-Alive pour réagir vite
       ::setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-      int keepidle = 10;  // 10s d'inactivité avant le 1er ping
-      int keepintvl = 5;  // 5s entre chaque ping
-      int keepcnt = 3;    // 3 échecs = déconnexion
+      int keepidle = 10;
+      int keepintvl = 5;
+      int keepcnt = 3;
       ::setsockopt(client, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
       ::setsockopt(client, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
       ::setsockopt(client, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
-      int rcvbuf = 3 * (int) NET_READ_SIZE;
-      if (::setsockopt(client, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
-          ESP_LOGW(TAG, "Could not set SO_RCVBUF, performance might be degraded");
-      }
+      // AUGMENTATION DE LA FENÊTRE TCP : 128 Ko pour saturer le lien du C6 sans interruption
+      int rcvbuf = 128 * 1024;
+      ::setsockopt(client, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
       char peer_text[16] = {};
       ::inet_ntoa_r(peer.sin_addr, peer_text, sizeof(peer_text));
@@ -200,8 +206,8 @@ void USBDisplay::run_network_task() {
       this->last_touch_valid_ = false;
 #endif
       this->status_pending_ = true;
+      vRingbufferReset(ringbuf);
       
-      // CORRECTION 1: Initialisation du chronomètre de réception
       TickType_t last_recv_time = xTaskGetTickCount();
 
       while (true) {
@@ -215,10 +221,17 @@ void USBDisplay::run_network_task() {
         this->send_queued_messages_(client);
 
         if (ready == 0) {
-          // CORRECTION 1: Vérification manuelle du timeout à cause des select() très courts
           if ((xTaskGetTickCount() - last_recv_time) > pdMS_TO_TICKS(NET_RECV_TIMEOUT_S * 1000)) {
             ESP_LOGW(TAG, "Sender silent for %d seconds, disconnecting", NET_RECV_TIMEOUT_S);
             break;
+          }
+          
+          // Dépilage asynchrone des données accumulées dans le buffer vers le décodeur
+          size_t item_size = 0;
+          char *item = (char *) xRingbufferReceiveUpTo(ringbuf, &item_size, 0, NET_READ_SIZE);
+          if (item != nullptr && item_size > 0) {
+            this->feed_((const uint8_t *) item, item_size, true);
+            vRingbufferReturnItem(ringbuf, (void *) item);
           }
           continue; 
         }
@@ -228,11 +241,24 @@ void USBDisplay::run_network_task() {
           break;
         }
 
+        // RECEPTION TCP ULTRA-RAPIDE : On pousse directement dans le Ring Buffer sans bloquer sur le décodage
         int received = ::recv(client, buffer, NET_READ_SIZE, 0);
         if (received > 0) {
-          // On a reçu des données, on remet le chronomètre à zéro
           last_recv_time = xTaskGetTickCount();
-          this->feed_(buffer, (size_t) received, true);
+          
+          // Envoyer les données brutes dans le tampon circulaire (attente max 10ms si saturé)
+          if (xRingbufferSend(ringbuf, buffer, received, pdMS_TO_TICKS(10)) != pdTRUE) {
+            ESP_LOGW(TAG, "Ring buffer full, dropping data packet");
+          }
+          
+          // Traitement immédiat d'une portion pour fluidifier
+          size_t item_size = 0;
+          char *item = (char *) xRingbufferReceiveUpTo(ringbuf, &item_size, 0, NET_READ_SIZE);
+          if (item != nullptr && item_size > 0) {
+            this->feed_((const uint8_t *) item, item_size, true);
+            vRingbufferReturnItem(ringbuf, (void *) item);
+          }
+          
           continue;
         }
         
