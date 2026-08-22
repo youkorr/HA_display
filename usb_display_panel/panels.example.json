@@ -1,0 +1,27 @@
+{
+  "token": "PASTE A LONG-LIVED ACCESS TOKEN HERE",
+  "url": "http://homeassistant:8123/lovelace/0",
+  "port": 5000,
+  "fps": 30,
+  "stats": true,
+
+  "panels": [
+    {
+      "name": "salon",
+      "host": "192.168.1.9",
+      "width": 1024,
+      "height": 600,
+      "rotate": 180,
+      "touch_rotate": 180
+    },
+    {
+      "name": "cuisine",
+      "host": "192.168.1.12",
+      "url": "http://homeassistant:8123/lovelace/cuisine",
+      "width": 800,
+      "height": 1280,
+      "rotate": 0,
+      "touch_rotate": 0
+    }
+  ]
+}
