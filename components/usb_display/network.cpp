@@ -139,7 +139,7 @@ void USBDisplay::run_network_task() {
   }
 
   // Création d'un Ring Buffer de 128 Ko pour découpler totalement la réception TCP du décodage lourd
-  RingbufHandle_t ringbuf = xRingbufferCreate(128 * 1024, RINGBUF_TYPE_BYTEbuf);
+  RingbufHandle_t ringbuf = xRingbufferCreate(128 * 1024, RINGBUF_TYPE_BYTEBUF);
   if (ringbuf == nullptr) {
     ESP_LOGE(TAG, "Could not create network ring buffer");
     heap_caps_free(buffer);
@@ -206,7 +206,7 @@ void USBDisplay::run_network_task() {
       this->last_touch_valid_ = false;
 #endif
       this->status_pending_ = true;
-      vRingbufferReset(ringbuf);
+      vRingbufferDelete(ringbuf);
       
       TickType_t last_recv_time = xTaskGetTickCount();
 
