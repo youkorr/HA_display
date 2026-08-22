@@ -20,7 +20,6 @@
 
 #include "esphome/core/log.h"
 #include "esp_heap_caps.h"
-#include "freertos/ringbuf.h"
 
 #include <cerrno>
 #include <cstring>
@@ -36,7 +35,7 @@ namespace usb_display {
 
 static const char *const TAG = "usb_display.net";
 
-// Augmenté à 32 Ko pour saturer le débit brut du lien C6 / Wi-Fi
+// OPTIMISATION : Augmentation de la taille de lecture (32 Ko) pour saturer le débit du C6/Wi-Fi
 static constexpr size_t NET_READ_SIZE = 32768;
 static constexpr int NET_RECV_TIMEOUT_S = 30;
 
@@ -107,7 +106,7 @@ void USBDisplay::send_queued_messages_(int client) {
     }
     
     if (::send(client, message, at, MSG_DONTWAIT) < 0)
-      return; 
+      return;
       
     xQueueReceive(this->touch_queue_, &event, 0);
   }
@@ -122,7 +121,7 @@ void USBDisplay::setup_network_() {
     this->touch_queue_ = xQueueCreate(8, sizeof(TouchEvent));
   }
 #endif
-  // Utilisation de tskNO_AFFINITY pour laisser FreeRTOS répartir la charge sur les deux cœurs RISC-V du P4
+  // Utilisation de tskNO_AFFINITY pour répartir la charge réseau sur les deux cœurs RISC-V du P4
   xTaskCreatePinnedToCore(USBDisplay::network_task, "udispnet", 4096, this, 4, nullptr, tskNO_AFFINITY);
   ESP_LOGCONFIG(TAG, "Listening on port %u for frames", (unsigned) this->port_);
 }
@@ -130,19 +129,9 @@ void USBDisplay::setup_network_() {
 void USBDisplay::network_task(void *param) { static_cast<USBDisplay *>(param)->run_network_task(); }
 
 void USBDisplay::run_network_task() {
-  // Allocation d'un gros buffer de lecture en mémoire interne/PSRAM
   auto *buffer = (uint8_t *) heap_caps_malloc(NET_READ_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (buffer == nullptr) {
     ESP_LOGE(TAG, "Could not allocate the %u byte receive buffer", (unsigned) NET_READ_SIZE);
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  // Création d'un Ring Buffer de 128 Ko pour découpler totalement la réception TCP du décodage lourd
-  RingbufHandle_t ringbuf = xRingbufferCreate(128 * 1024, RINGBUF_TYPE_BYTEBUF);
-  if (ringbuf == nullptr) {
-    ESP_LOGE(TAG, "Could not create network ring buffer");
-    heap_caps_free(buffer);
     vTaskDelete(nullptr);
     return;
   }
@@ -192,9 +181,12 @@ void USBDisplay::run_network_task() {
       ::setsockopt(client, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
       ::setsockopt(client, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
-      // AUGMENTATION DE LA FENÊTRE TCP : 128 Ko pour saturer le lien du C6 sans interruption
-      int rcvbuf = 128 * 1024;
-      ::setsockopt(client, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+      // OPTIMISATION HAUT DÉBIT : Fenêtre de réception TCP élargie à ~96 Ko (3 * 32 Ko)
+      // Empêche le PC de s'arrêter d'envoyer pendant que le P4 décode la frame.
+      int rcvbuf = 3 * (int) NET_READ_SIZE;
+      if (::setsockopt(client, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+          ESP_LOGW(TAG, "Could not set SO_RCVBUF");
+      }
 
       char peer_text[16] = {};
       ::inet_ntoa_r(peer.sin_addr, peer_text, sizeof(peer_text));
@@ -206,7 +198,6 @@ void USBDisplay::run_network_task() {
       this->last_touch_valid_ = false;
 #endif
       this->status_pending_ = true;
-      vRingbufferDelete(ringbuf);
       
       TickType_t last_recv_time = xTaskGetTickCount();
 
@@ -225,14 +216,6 @@ void USBDisplay::run_network_task() {
             ESP_LOGW(TAG, "Sender silent for %d seconds, disconnecting", NET_RECV_TIMEOUT_S);
             break;
           }
-          
-          // Dépilage asynchrone des données accumulées dans le buffer vers le décodeur
-          size_t item_size = 0;
-          char *item = (char *) xRingbufferReceiveUpTo(ringbuf, &item_size, 0, NET_READ_SIZE);
-          if (item != nullptr && item_size > 0) {
-            this->feed_((const uint8_t *) item, item_size, true);
-            vRingbufferReturnItem(ringbuf, (void *) item);
-          }
           continue; 
         }
         
@@ -241,24 +224,10 @@ void USBDisplay::run_network_task() {
           break;
         }
 
-        // RECEPTION TCP ULTRA-RAPIDE : On pousse directement dans le Ring Buffer sans bloquer sur le décodage
         int received = ::recv(client, buffer, NET_READ_SIZE, 0);
         if (received > 0) {
           last_recv_time = xTaskGetTickCount();
-          
-          // Envoyer les données brutes dans le tampon circulaire (attente max 10ms si saturé)
-          if (xRingbufferSend(ringbuf, buffer, received, pdMS_TO_TICKS(10)) != pdTRUE) {
-            ESP_LOGW(TAG, "Ring buffer full, dropping data packet");
-          }
-          
-          // Traitement immédiat d'une portion pour fluidifier
-          size_t item_size = 0;
-          char *item = (char *) xRingbufferReceiveUpTo(ringbuf, &item_size, 0, NET_READ_SIZE);
-          if (item != nullptr && item_size > 0) {
-            this->feed_((const uint8_t *) item, item_size, true);
-            vRingbufferReturnItem(ringbuf, (void *) item);
-          }
-          
+          this->feed_(buffer, (size_t) received, true);
           continue;
         }
         
