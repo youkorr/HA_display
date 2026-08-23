@@ -12,7 +12,6 @@ that half -- it captures the screen, encodes it and pushes it, and runs on
 Linux, macOS and Windows. Espressif's own answer is the windows_driver
 directory of their usb_extend_screen example, which is Windows-only and needs
 a signed driver; the board does not care which of the two is talking to it.
-
 ha_send.py, also next to this file, is a third: instead of mirroring a screen
 it renders a Home Assistant dashboard in a browser with no window and sends
 only the rectangles that changed, which is what a panel on a battery can
@@ -192,14 +191,14 @@ async def to_code(config):
     cg.add(var.set_rotation(config[CONF_ROTATION]))
     cg.add(var.set_max_fps(config[CONF_MAX_FPS]))
 
-    # ESP32-P4 display pipeline: the JPEG codec already uses the P4's 2D-DMA
-    # internally for 2D image transfers. Keep the 2D-DMA operation path in IRAM
-    # and its ISR IRAM-safe so the decode/transfer path is not unnecessarily
-    # stalled by flash/cache activity. The explicit PPA path in usb_display.cpp
-    # handles rotation/mirroring; together these are the two hardware engines
-    # used by this component rather than CPU memcpy/rotation.
-    esp32.add_idf_sdkconfig_option("CONFIG_DMA2D_OPERATION_FUNC_IN_IRAM", True)
-    esp32.add_idf_sdkconfig_option("CONFIG_DMA2D_ISR_IRAM_SAFE", True)
+    # Do not force DMA2D's operation callbacks into IRAM here. In ESP-IDF 5.5.x
+    # the JPEG decoder's DMA2D path invokes the registered on_job_picked callback,
+    # and enabling CONFIG_DMA2D_OPERATION_FUNC_IN_IRAM makes DMA2D reject a
+    # callback that is not itself placed in IRAM. That is the source of:
+    #   dma2d_enqueue: on_job_picked not in IRAM
+    #   jpeg_decoder_process: enqueue dma2d failed
+    # The P4 JPEG driver already uses DMA2D internally. Keep the normal driver
+    # path and use PPA separately for the explicit rotation path in C++.
 
     if (port := config.get(CONF_PORT)) is not None:
         cg.add(var.set_port(port))
